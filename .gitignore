@@ -6,6 +6,9 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+Lib/
+Scripts/
+pyvenv.cfg
 
 # Environment secrets
 .env

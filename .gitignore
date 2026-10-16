@@ -9,6 +9,8 @@ venv/
 Lib/
 Scripts/
 pyvenv.cfg
+etc/
+share/
 
 # Environment secrets
 .env

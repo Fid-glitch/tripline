@@ -1,6 +1,37 @@
 
 from datetime import datetime, timezone
 
+def evaluate_policy(context):
+    """Return a structured, explainable policy decision."""
+
+    if context is None:
+        context = {}
+
+    if not isinstance(context, dict):
+        return {
+            "decision": "BLOCK",
+            "reason": "Context must be a dictionary",
+            "rule_id": "INPUT-001",
+            "risk_level": "HIGH",
+            "checks": [
+                {"name": "Context validation", "passed": False,
+                 "detail": "Expected a dictionary"}
+            ],
+            "missing_requirements": [],
+            "next_step": "Provide valid scenario context",
+        }
+
+    def result(decision, reason, rule_id, risk, checks,
+               missing=None, next_step="No further action required"):
+        return {
+            "decision": decision,
+            "reason": reason,
+            "rule_id": rule_id,
+            "risk_level": risk,
+            "checks": checks,
+            "missing_requirements": missing or [],
+            "next_step": next_step,
+        }
 
 # Demo fixtures only. These are NOT real-world consent records.
 # A real product would use a trusted identity/consent provider.

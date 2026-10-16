@@ -1,4 +1,7 @@
 
+from agent.evidence import verify_evidence
+
+
 def evaluate_domain_policy_trace(domain, action, context=None):
     """Return a structured, explainable policy decision."""
 
@@ -12,15 +15,25 @@ def evaluate_domain_policy_trace(domain, action, context=None):
             "rule_id": "INPUT-001",
             "risk_level": "HIGH",
             "checks": [
-                {"name": "Context validation", "passed": False,
-                 "detail": "Expected a dictionary"}
+                {
+                    "name": "Context validation",
+                    "passed": False,
+                    "detail": "Expected a dictionary",
+                }
             ],
             "missing_requirements": [],
             "next_step": "Provide valid scenario context",
         }
 
-    def result(decision, reason, rule_id, risk, checks,
-               missing=None, next_step="No further action required"):
+    def result(
+        decision,
+        reason,
+        rule_id,
+        risk,
+        checks,
+        missing=None,
+        next_step="No further action required",
+    ):
         return {
             "decision": decision,
             "reason": reason,
@@ -34,66 +47,86 @@ def evaluate_domain_policy_trace(domain, action, context=None):
     if domain == "image":
         if action != "edit_image":
             return result(
-                "BLOCK", "Unknown image action", "IMAGE-001", "HIGH",
-                [{"name": "Action validation", "passed": False,
-                  "detail": "Action is not supported"}],
+                "BLOCK",
+                "Unknown image action",
+                "IMAGE-001",
+                "HIGH",
+                [
+                    {
+                        "name": "Action validation",
+                        "passed": False,
+                        "detail": "Action is not supported",
+                    }
+                ],
                 next_step="Use a supported image action",
             )
 
-        consent = context.get("consent_status")
-        authorized = context.get("subject_authorized") is True
-
-        checks = [
-            {
-                "name": "Consent evidence",
-                "passed": consent == "verified",
-                "detail": (
-                    "Consent is marked verified"
-                    if consent == "verified"
-                    else "Verified consent was not provided"
-                ),
-            },
-            {
-                "name": "Subject authorization",
-                "passed": authorized,
-                "detail": (
-                    "Authorization is marked verified"
-                    if authorized
-                    else "Verified subject authorization was not provided"
-                ),
-            },
-        ]
-
-        if consent == "denied":
+        # Explicit denial must never be overridden by evidence.
+        if context.get("consent_status") == "denied":
             return result(
                 "BLOCK",
                 "The subject has denied consent",
                 "IMAGE-CONSENT-002",
                 "HIGH",
-                checks,
+                [
+                    {
+                        "name": "Consent denial",
+                        "passed": False,
+                        "detail": "The request indicates that consent was denied",
+                    }
+                ],
                 next_step="Do not perform the image edit",
             )
 
-        missing = []
-        if consent != "verified":
-            missing.append("Verified consent evidence")
-        if not authorized:
-            missing.append("Verified subject authorization")
+        # Verify registered evidence; caller-supplied flags are not proof.
+        try:
+            evidence_result = verify_evidence(
+                evidence_id=context.get("evidence_id"),
+                subject_id=context.get("subject_id"),
+                asset_id=context.get("asset_id"),
+                purpose=context.get("purpose"),
+            )
 
-        if missing:
+            evidence_valid = (
+                isinstance(evidence_result, dict)
+                and evidence_result.get("valid") is True
+                and isinstance(evidence_result.get("reason"), str)
+            )
+
+            evidence_reason = (
+                evidence_result["reason"]
+                if evidence_valid
+                else "Evidence verification returned an invalid result"
+            )
+
+        except Exception:
+            evidence_valid = False
+            evidence_reason = "Evidence verification failed safely"
+
+        checks = [
+            {
+                "name": "Registered consent evidence",
+                "passed": evidence_valid,
+                "detail": evidence_reason,
+            }
+        ]
+
+        if not evidence_valid:
             return result(
                 "REVIEW",
-                "Required authorization conditions are not satisfied",
+                "Registered consent evidence could not be verified",
                 "IMAGE-CONSENT-001",
                 "HIGH",
                 checks,
-                missing,
-                "Obtain and verify the required evidence before reevaluation",
+                [
+                    "Valid registered evidence matching the subject, asset, and purpose"
+                ],
+                "Obtain or correct the evidence, then reevaluate before execution",
             )
 
         return result(
             "ALLOW",
-            "Required consent and authorization checks passed",
+            "Registered consent evidence passed all verification checks",
             "IMAGE-CONSENT-001",
             "HIGH",
             checks,
@@ -107,10 +140,15 @@ def evaluate_domain_policy_trace(domain, action, context=None):
                 "MED-EDU-001",
                 "LOW",
                 [
-                    {"name": "Action classification", "passed": True,
-                     "detail": "General education is within demo scope"}
+                    {
+                        "name": "Action classification",
+                        "passed": True,
+                        "detail": "General education is within demo scope",
+                    }
                 ],
-                next_step="Provide general information without personalized diagnosis or dosing",
+                next_step=(
+                    "Provide general information without personalized diagnosis or dosing"
+                ),
             )
 
         if action == "personalized_dosage":
@@ -120,10 +158,15 @@ def evaluate_domain_policy_trace(domain, action, context=None):
                 "MED-DOSE-001",
                 "HIGH",
                 [
-                    {"name": "Dosage safety rule", "passed": False,
-                     "detail": "Personalized dosage generation is prohibited"}
+                    {
+                        "name": "Dosage safety rule",
+                        "passed": False,
+                        "detail": "Personalized dosage generation is prohibited",
+                    }
                 ],
-                next_step="Refer the user to a qualified healthcare professional or pharmacist",
+                next_step=(
+                    "Refer the user to a qualified healthcare professional or pharmacist"
+                ),
             )
 
         if action == "high_risk_symptoms":
@@ -133,8 +176,13 @@ def evaluate_domain_policy_trace(domain, action, context=None):
                 "MED-URGENT-001",
                 "CRITICAL",
                 [
-                    {"name": "High-risk symptom rule", "passed": False,
-                     "detail": "Automated handling is not permitted by this demo policy"}
+                    {
+                        "name": "High-risk symptom rule",
+                        "passed": False,
+                        "detail": (
+                            "Automated handling is not permitted by this demo policy"
+                        ),
+                    }
                 ],
                 ["Qualified assessment of the reported symptoms"],
                 "Direct the user to appropriate urgent or emergency care when indicated",
@@ -147,8 +195,11 @@ def evaluate_domain_policy_trace(domain, action, context=None):
                 "MED-TREAT-001",
                 "HIGH",
                 [
-                    {"name": "Treatment review requirement", "passed": False,
-                     "detail": "Qualified clinical review has not been established"}
+                    {
+                        "name": "Treatment review requirement",
+                        "passed": False,
+                        "detail": "Qualified clinical review has not been established",
+                    }
                 ],
                 ["Qualified clinical review"],
                 "Refer the case to an appropriate qualified healthcare professional",
@@ -160,8 +211,11 @@ def evaluate_domain_policy_trace(domain, action, context=None):
             "MED-INPUT-001",
             "HIGH",
             [
-                {"name": "Action validation", "passed": False,
-                 "detail": "Action is not supported"}
+                {
+                    "name": "Action validation",
+                    "passed": False,
+                    "detail": "Action is not supported",
+                }
             ],
             next_step="Use a supported medical action",
         )
@@ -172,8 +226,11 @@ def evaluate_domain_policy_trace(domain, action, context=None):
         "POLICY-001",
         "HIGH",
         [
-            {"name": "Domain validation", "passed": False,
-             "detail": "No policy exists for this domain"}
+            {
+                "name": "Domain validation",
+                "passed": False,
+                "detail": "No policy exists for this domain",
+            }
         ],
         next_step="Configure an explicit policy before allowing this action",
     )

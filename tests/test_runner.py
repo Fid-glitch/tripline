@@ -6,14 +6,15 @@ from agent.runner import run_scenario
 
 
 class TestScenarioRunner(unittest.TestCase):
-
     def test_verified_image_consent_runs_mock(self):
         result = run_scenario(
             "image",
             "edit_image",
             {
-                "consent_status": "verified",
-                "subject_authorized": True,
+                "evidence_id": "mock-consent-001",
+                "subject_id": "person-123",
+                "asset_id": "image-123",
+                "purpose": "portrait_edit",
             },
         )
 
@@ -37,7 +38,8 @@ class TestScenarioRunner(unittest.TestCase):
     def test_personalized_dosage_does_not_execute(self):
         with patch("agent.runner._mock_action") as mock_action:
             result = run_scenario(
-                "medical", "personalized_dosage"
+                "medical",
+                "personalized_dosage",
             )
 
         self.assertEqual(result["decision"], "BLOCK")
@@ -46,7 +48,8 @@ class TestScenarioRunner(unittest.TestCase):
 
     def test_general_education_runs_mock(self):
         result = run_scenario(
-            "medical", "general_education"
+            "medical",
+            "general_education",
         )
 
         self.assertEqual(result["decision"], "ALLOW")
@@ -56,4 +59,3 @@ class TestScenarioRunner(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

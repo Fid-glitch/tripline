@@ -35,6 +35,8 @@ def _mock_action(domain, action):
 
 
 def _audit(event):
+    """Append one event to the domain audit log."""
+
     AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
 
     with AUDIT_LOG.open("a", encoding="utf-8") as file:
@@ -50,6 +52,7 @@ def run_scenario(domain, action, context=None):
     result = None
     execution_error = None
 
+    # Only ALLOW may reach the simulated action.
     if trace["decision"] == "ALLOW":
         try:
             result = _mock_action(domain, action)

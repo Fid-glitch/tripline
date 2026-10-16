@@ -8,6 +8,7 @@ __pycache__/
 venv/
 Lib/
 Scripts/
+!scripts/
 pyvenv.cfg
 etc/
 share/
@@ -19,3 +20,4 @@ share/
 # Generated logs
 data/*.jsonl
 data/*.log
+logs/

@@ -14,3 +14,11 @@ venv/
 # Generated logs
 data/*.jsonl
 data/*.log
+# Additional local and deployment files
+.venv-1/
+.pytest_cache/
+.streamlit/secrets.toml
+*.bak
+
+# Local project archive
+tripline-source.zip

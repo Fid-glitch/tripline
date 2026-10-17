@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.domain_policies import evaluate_domain_policy_trace
+from agent.audit import write_event, read_events
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -12,7 +13,6 @@ AUDIT_LOG = ROOT / "data" / "domain_audit.jsonl"
 
 def _mock_action(domain, action):
     """Simulate an allowed action without real-world side effects."""
-
     if domain == "image" and action == "edit_image":
         return {
             "status": "simulated",
@@ -28,6 +28,18 @@ def _mock_action(domain, action):
             ),
         }
 
+    if domain == "company" and action == "redact_sensitive_data":
+        return {
+            "status": "simulated",
+            "message": "Sensitive content was redacted in the simulated workflow; no raw secrets were disclosed.",
+        }
+
+    if domain == "company" and action == "general_company_question":
+        return {
+            "status": "simulated",
+            "message": "Safe company guidance delivered without accessing confidential company data.",
+        }
+
     return {
         "status": "simulated",
         "message": "Mock action completed.",
@@ -35,17 +47,12 @@ def _mock_action(domain, action):
 
 
 def _audit(event):
-    """Append one event to the domain audit log."""
-
-    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-
-    with AUDIT_LOG.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(event) + "\n")
+    """Append a sanitized event to the existing domain audit log."""
+    write_event(event, log_type="domain", path=AUDIT_LOG)
 
 
 def run_scenario(domain, action, context=None):
     """Evaluate policy, enforce the result, and record the decision."""
-
     trace = evaluate_domain_policy_trace(domain, action, context)
 
     executed = False
@@ -86,16 +93,22 @@ def run_scenario(domain, action, context=None):
 
 
 def read_domain_audit():
-    """Return domain audit events, newest first."""
+    """Return domain audit events newest-first, skipping malformed records."""
+    if AUDIT_LOG == (ROOT / "data" / "domain_audit.jsonl"):
+        return read_events("domain")
 
     if not AUDIT_LOG.exists():
         return []
 
     events = []
-
     with AUDIT_LOG.open("r", encoding="utf-8") as file:
         for line in file:
-            if line.strip():
-                events.append(json.loads(line))
-
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
     return list(reversed(events))

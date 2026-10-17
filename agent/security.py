@@ -1,13 +1,15 @@
+
 import copy
 import hashlib
 import json
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 from agent import tools
 from agent.data_protection import redact_text
+from agent.audit import write_event, read_events
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -30,27 +32,28 @@ SENSITIVE_FILES = {
 
 ALLOWED_TOOLS = {"read_file", "run_shell", "http_request"}
 
-# --- Phase 4 settings -------------------------------------------------------
-# A tool argument holding free-text DATA (never a path, URL, method or command)
-# may be declared redactable here as {"tool_name": "argument_name"}. Only that
-# one argument is ever redacted. None of the current tools has such an argument,
-# so this is empty and REDACT cannot execute anything today.
+# Only explicitly declared free-text DATA arguments may be redacted.
+# Paths, URLs, methods, and commands must never be redacted and executed.
 REDACTABLE_FIELDS = {}
 
-# How long an approval request stays valid (demo value).
+# Demo-only approval expiry.
 APPROVAL_TTL_SECONDS = 900
 
-_ORDER = ("ALLOW", "REDACT", "ASK", "BLOCK")  # later = stricter
-_LEGACY_LABEL = {"ALLOW": "ALLOW", "REDACT": "REDACT", "ASK": "REVIEW", "BLOCK": "BLOCK"}
+_ORDER = ("ALLOW", "REDACT", "ASK", "BLOCK")
+_LEGACY_LABEL = {
+    "ALLOW": "ALLOW",
+    "REDACT": "REDACT",
+    "ASK": "REVIEW",
+    "BLOCK": "BLOCK",
+}
 _MAX_AUDIT_TEXT = 300
 
-# Demo-only, in-memory approvals: {approval_id: record}. See approve_pending().
+# Demo-only in-memory approvals.
 _PENDING_APPROVALS = {}
 
 
 def evaluate_policy(tool_name, args):
     """Evaluate a request without executing its tool."""
-
     if tool_name not in ALLOWED_TOOLS:
         return "BLOCK", "Unknown tool"
 
@@ -76,7 +79,6 @@ def evaluate_policy(tool_name, args):
             return "BLOCK", "Invalid command arguments"
 
         command = args["command"]
-
         if not isinstance(command, (list, tuple)):
             return "BLOCK", "Command must be a list of arguments"
 
@@ -96,12 +98,10 @@ def evaluate_policy(tool_name, args):
             return "BLOCK", "HTTP method and URL must be strings"
 
         method = method.upper()
-
         if method not in {"GET", "POST", "PUT", "DELETE"}:
             return "BLOCK", "HTTP method is not allowed"
 
         parsed = urlparse(url)
-
         if (
             parsed.scheme not in {"http", "https"}
             or not parsed.hostname
@@ -142,14 +142,7 @@ def _sanitize_for_audit(value, depth=0):
 
 
 def _write_audit(tool_name, args, decision, reason, executed, outcome, **extra):
-    """Append one structured audit event.
-
-    Arguments, reason and extra fields are redacted before they are written,
-    so raw secrets never reach the log.
-    """
-
-    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-
+    """Append one structured audit event through the shared writer."""
     event = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "tool": _sanitize_for_audit(tool_name),
@@ -160,9 +153,8 @@ def _write_audit(tool_name, args, decision, reason, executed, outcome, **extra):
         "outcome": outcome,
     }
     event.update(_sanitize_for_audit(extra))
-
-    with AUDIT_LOG.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(event, default=str) + "\n")
+    # Keep AUDIT_LOG patchable for existing tests and callers.
+    write_event(event, log_type="security", path=AUDIT_LOG)
 
 
 def _try_audit(*args, **kwargs):
@@ -198,11 +190,17 @@ def _get_or_create_pending(tool_name, args, reason):
     if fingerprint is None:
         return None
 
-    for approval_id in [k for k, v in _PENDING_APPROVALS.items() if _expired(v)]:
+    expired_ids = [
+        key for key, value in _PENDING_APPROVALS.items() if _expired(value)
+    ]
+    for approval_id in expired_ids:
         del _PENDING_APPROVALS[approval_id]
 
     for approval_id, record in _PENDING_APPROVALS.items():
-        if record["fingerprint"] == fingerprint and record["status"] == "pending":
+        if (
+            record["fingerprint"] == fingerprint
+            and record["status"] == "pending"
+        ):
             return approval_id
 
     approval_id = "apr-" + secrets.token_hex(8)
@@ -221,15 +219,21 @@ def _get_or_create_pending(tool_name, args, reason):
 def _approval_is_valid(approval_id, tool_name, args):
     if not isinstance(approval_id, str):
         return False
+
     record = _PENDING_APPROVALS.get(approval_id)
-    if record is None or record["status"] != "approved" or _expired(record):
+    if (
+        record is None
+        or record["status"] != "approved"
+        or _expired(record)
+    ):
         return False
+
     fingerprint = _fingerprint(tool_name, args)
     return fingerprint is not None and fingerprint == record["fingerprint"]
 
 
 def list_pending_approvals():
-    """Return pending requests (arguments already redacted) for a UI."""
+    """Return pending requests with already-sanitized arguments."""
     return [
         {
             "approval_id": approval_id,
@@ -244,12 +248,10 @@ def list_pending_approvals():
 
 
 def approve_pending(approval_id, approver):
-    """Record a human approval for one pending request. Returns True/False.
+    """Approve a pending request in this process (demo only).
 
-    DEMO ONLY: this runs in the same process and does not authenticate the
-    approver. Only trusted code (such as the UI's Approve button) should call
-    it. Approvals are single-use, expire, and only fit the exact tool and
-    arguments that were reviewed. A BLOCK can never be approved.
+    This does not authenticate the approver. Approval is single-use, expires,
+    and applies only to the exact arguments that were reviewed.
     """
     if not isinstance(approval_id, str):
         return False
@@ -257,14 +259,24 @@ def approve_pending(approval_id, approver):
         return False
 
     record = _PENDING_APPROVALS.get(approval_id)
-    if record is None or record["status"] != "pending" or _expired(record):
+    if (
+        record is None
+        or record["status"] != "pending"
+        or _expired(record)
+    ):
         return False
 
     record["status"] = "approved"
     record["approver"] = _safe_text(approver.strip())
     _try_audit(
-        record["tool"], record["arguments"], "REVIEW", "Approval granted",
-        False, "approved", stage="approval", approval_id=approval_id,
+        record["tool"],
+        record["arguments"],
+        "REVIEW",
+        "Approval granted",
+        False,
+        "approved",
+        stage="approval",
+        approval_id=approval_id,
         approver=record["approver"],
     )
     return True
@@ -274,33 +286,48 @@ def approve_pending(approval_id, approver):
 
 def _blocked(reason, rule_id):
     return {
-        "decision": "BLOCK", "reason": reason, "rules": [rule_id], "score": 100,
-        "can_execute": False, "exec_args": None, "redacted": False,
+        "decision": "BLOCK",
+        "reason": reason,
+        "rules": [rule_id],
+        "score": 100,
+        "can_execute": False,
+        "exec_args": None,
+        "redacted": False,
         "redaction_count": 0,
     }
 
 
 def _decide(tool_name, args):
-    """Decide WITHOUT executing anything. Any unexpected error means BLOCK."""
+    """Decide without executing. Unexpected errors fail closed."""
     try:
-        from agent import policy_engine as pe  # imported here: it imports this module
+        from agent import policy_engine as pe
 
-        field = REDACTABLE_FIELDS.get(tool_name) if isinstance(tool_name, str) else None
-        has_field = bool(field) and isinstance(args, dict) and field in args
+        field = (
+            REDACTABLE_FIELDS.get(tool_name)
+            if isinstance(tool_name, str)
+            else None
+        )
+        has_field = (
+            bool(field) and isinstance(args, dict) and field in args
+        )
         core_args = (
-            {k: v for k, v in args.items() if k != field} if has_field else args
+            {key: value for key, value in args.items() if key != field}
+            if has_field
+            else args
         )
 
-        # The original gateway policy still runs and can only make things stricter.
         legacy_label, legacy_reason = evaluate_policy(tool_name, core_args)
         legacy = pe.normalize_decision(legacy_label)
 
         request = {"tool_name": tool_name, "args": core_args}
         if has_field:
             request["content"] = args[field]
-        result = pe.evaluate_request(request)
 
-        if not isinstance(result, pe.PolicyResult) or result.decision not in _ORDER:
+        result = pe.evaluate_request(request)
+        if (
+            not isinstance(result, pe.PolicyResult)
+            or result.decision not in _ORDER
+        ):
             raise TypeError("Unexpected policy engine result")
 
         decision = result.decision
@@ -313,36 +340,51 @@ def _decide(tool_name, args):
             rules.append(f"LEGACY-POLICY-{legacy}")
 
         outcome = {
-            "decision": decision, "reason": reason, "rules": rules,
-            "score": result.risk_score, "can_execute": False,
-            "exec_args": None, "redacted": False, "redaction_count": 0,
+            "decision": decision,
+            "reason": reason,
+            "rules": rules,
+            "score": result.risk_score,
+            "can_execute": False,
+            "exec_args": None,
+            "redacted": False,
+            "redaction_count": 0,
         }
 
         if decision == "ALLOW":
             outcome["can_execute"] = True
             outcome["exec_args"] = args
+
         elif decision == "REDACT":
             sanitized = result.sanitized_content
             if has_field and isinstance(sanitized, str):
-                # Execution after redaction is allowed only if the sanitized
-                # content passes the engine again with an ALLOW.
-                recheck = pe.evaluate_request(
-                    {"tool_name": tool_name, "args": core_args, "content": sanitized}
-                )
-                if isinstance(recheck, pe.PolicyResult) and recheck.decision == "ALLOW":
+                recheck = pe.evaluate_request({
+                    "tool_name": tool_name,
+                    "args": core_args,
+                    "content": sanitized,
+                })
+                if (
+                    isinstance(recheck, pe.PolicyResult)
+                    and recheck.decision == "ALLOW"
+                ):
                     outcome["can_execute"] = True
                     outcome["exec_args"] = {**args, field: sanitized}
                     outcome["redacted"] = True
                     outcome["redaction_count"] = len(result.redactions)
                 else:
                     outcome["decision"] = "BLOCK"
-                    outcome["reason"] = "Redacted content still failed the policy re-check"
-                    outcome["rules"].append("GATEWAY-REDACTION-RECHECK-001")
+                    outcome["reason"] = (
+                        "Redacted content still failed the policy re-check"
+                    )
+                    outcome["rules"].append(
+                        "GATEWAY-REDACTION-RECHECK-001"
+                    )
             else:
                 outcome["reason"] = (
-                    reason + " (no redactable argument is declared for this tool, "
+                    reason
+                    + " (no redactable argument is declared for this tool, "
                     "so nothing was executed)"
                 )
+
         return outcome
 
     except Exception:
@@ -352,11 +394,19 @@ def _decide(tool_name, args):
         )
 
 
-def _build(d, reason, executed, audit_ok, pending_id=None, approval_id=None,
-           approved=False, **more):
+def _build(
+    d,
+    reason,
+    executed,
+    audit_ok,
+    pending_id=None,
+    approval_id=None,
+    approved=False,
+    **more,
+):
     out = {
-        "decision": _LEGACY_LABEL[d["decision"]],   # legacy vocabulary (REVIEW)
-        "policy_decision": d["decision"],           # ALLOW / REDACT / ASK / BLOCK
+        "decision": _LEGACY_LABEL[d["decision"]],
+        "policy_decision": d["decision"],
         "reason": reason,
         "risk_score": d["score"],
         "rule_ids": list(d["rules"]),
@@ -373,57 +423,72 @@ def _build(d, reason, executed, audit_ok, pending_id=None, approval_id=None,
 
 
 def execute_tool(tool_name, args, approval_id=None):
-    """Decide with the policy engine first; execute only what is permitted.
+    """Evaluate policy, audit intent, and execute only permitted operations.
 
-    - ALLOW: runs.
-    - REDACT: runs only the sanitized arguments, and only if they pass the
-      policy again.
-    - ASK: does not run. Returns pending_approval=True and an approval_id. It
-      runs only on a later call whose approval_id was approved through
-      approve_pending() for these exact arguments.
-    - BLOCK: never runs.
-    The returned "decision" keeps the legacy vocabulary (ASK is shown as
-    REVIEW); "policy_decision" holds the normalized value.
+    ALLOW runs. REDACT runs only after a successful policy re-check. ASK
+    requires a valid approval. BLOCK never runs. The legacy decision label
+    uses REVIEW for ASK.
     """
-
     try:
-        snapshot = copy.deepcopy(args)  # evaluate and execute the same values
+        snapshot = copy.deepcopy(args)
     except Exception:
         snapshot = None
-        d = _blocked("Arguments could not be copied safely", "GATEWAY-ARGS-001")
+        decision = _blocked(
+            "Arguments could not be copied safely", "GATEWAY-ARGS-001"
+        )
     else:
-        d = _decide(tool_name, snapshot)
+        decision = _decide(tool_name, snapshot)
 
     approved = False
     pending_id = None
-    if d["decision"] == "ASK":
+    if decision["decision"] == "ASK":
         if _approval_is_valid(approval_id, tool_name, snapshot):
             approved = True
         else:
-            pending_id = _get_or_create_pending(tool_name, snapshot, d["reason"])
+            pending_id = _get_or_create_pending(
+                tool_name, snapshot, decision["reason"]
+            )
 
-    label = _LEGACY_LABEL[d["decision"]]
+    label = _LEGACY_LABEL[decision["decision"]]
     extra = {
-        "policy_decision": d["decision"],
-        "risk_score": d["score"],
-        "rule_ids": d["rules"],
-        "redacted": d["redacted"],
-        "redaction_count": d["redaction_count"],
+        "policy_decision": decision["decision"],
+        "risk_score": decision["score"],
+        "rule_ids": decision["rules"],
+        "redacted": decision["redacted"],
+        "redaction_count": decision["redaction_count"],
         "approval_id": pending_id or (approval_id if approved else None),
     }
 
-    if not (d["can_execute"] or approved):
+    if not (decision["can_execute"] or approved):
         outcome = "pending_approval" if pending_id else "not_executed"
         audit_ok = _try_audit(
-            tool_name, snapshot, label, d["reason"], False, outcome,
-            stage="decision", **extra,
+            tool_name,
+            snapshot,
+            label,
+            decision["reason"],
+            False,
+            outcome,
+            stage="decision",
+            **extra,
         )
-        return _build(d, d["reason"], False, audit_ok, pending_id=pending_id)
+        return _build(
+            decision,
+            decision["reason"],
+            False,
+            audit_ok,
+            pending_id=pending_id,
+        )
 
-    # Fail closed: if the intent cannot be recorded, nothing runs.
+    # Fail closed: if intent cannot be recorded, do not execute.
     if not _try_audit(
-        tool_name, snapshot, label, d["reason"], False, "authorized",
-        stage="pre_execution", **extra,
+        tool_name,
+        snapshot,
+        label,
+        decision["reason"],
+        False,
+        "authorized",
+        stage="pre_execution",
+        **extra,
     ):
         denied = _blocked(
             "Audit log unavailable; execution refused (fail closed)",
@@ -431,9 +496,9 @@ def execute_tool(tool_name, args, approval_id=None):
         )
         return _build(denied, denied["reason"], False, False)
 
-    exec_args = snapshot if approved else d["exec_args"]
+    exec_args = snapshot if approved else decision["exec_args"]
     if approved:
-        _PENDING_APPROVALS[approval_id]["status"] = "used"  # single use
+        _PENDING_APPROVALS[approval_id]["status"] = "used"
 
     try:
         if tool_name == "read_file":
@@ -444,35 +509,63 @@ def execute_tool(tool_name, args, approval_id=None):
             result = tools.http_request(**exec_args)
     except Exception as error:
         audit_ok = _try_audit(
-            tool_name, snapshot, label, d["reason"], True, "error",
-            stage="outcome", **extra,
+            tool_name,
+            snapshot,
+            label,
+            decision["reason"],
+            True,
+            "error",
+            stage="outcome",
+            **extra,
         )
         return _build(
-            d, d["reason"], True, audit_ok, approval_id=approval_id,
-            approved=approved, error=_safe_text(str(error)),
+            decision,
+            decision["reason"],
+            True,
+            audit_ok,
+            approval_id=approval_id,
+            approved=approved,
+            error=_safe_text(str(error)),
         )
 
     audit_ok = _try_audit(
-        tool_name, snapshot, label, d["reason"], True, "success",
-        stage="outcome", **extra,
+        tool_name,
+        snapshot,
+        label,
+        decision["reason"],
+        True,
+        "success",
+        stage="outcome",
+        **extra,
     )
     return _build(
-        d, d["reason"], True, audit_ok, approval_id=approval_id,
-        approved=approved, result=result,
+        decision,
+        decision["reason"],
+        True,
+        audit_ok,
+        approval_id=approval_id,
+        approved=approved,
+        result=result,
     )
 
 
 def read_audit_log():
-    """Return audit events, newest first."""
+    """Return security audit events newest-first, skipping malformed lines."""
+    if AUDIT_LOG == (ROOT / "data" / "audit.jsonl"):
+        return read_events("security")
 
     if not AUDIT_LOG.exists():
         return []
 
     events = []
-
     with AUDIT_LOG.open("r", encoding="utf-8") as file:
         for line in file:
-            if line.strip():
-                events.append(json.loads(line))
-
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
     return list(reversed(events))

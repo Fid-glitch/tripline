@@ -102,6 +102,42 @@ class TestDomainPolicies(unittest.TestCase):
 
         self.assertEqual(decision, "BLOCK")
 
+    def test_general_company_question_allowed(self):
+        decision, _ = evaluate_domain_policy(
+            "company",
+            "general_company_question",
+            {},
+        )
+
+        self.assertEqual(decision, "ALLOW")
+
+    def test_confidential_document_to_personal_email_blocked(self):
+        decision, _ = evaluate_domain_policy(
+            "company",
+            "share_confidential_document",
+            {"destination_type": "personal"},
+        )
+
+        self.assertEqual(decision, "BLOCK")
+
+    def test_prompt_injection_blocked(self):
+        decision, _ = evaluate_domain_policy(
+            "company",
+            "prompt_injection",
+            {},
+        )
+
+        self.assertEqual(decision, "BLOCK")
+
+    def test_sensitive_redaction_requires_verified_workflow(self):
+        decision, _ = evaluate_domain_policy(
+            "company",
+            "redact_sensitive_data",
+            {},
+        )
+
+        self.assertEqual(decision, "REVIEW")
+
 
 if __name__ == "__main__":
     unittest.main()
